@@ -33,6 +33,10 @@ REQUEST_CMD_LIST = [
     REQUEST_CMD_UDP_ASSOCIATE,
 ]
 
+ATYP_IPV4_BS = b'\x01'
+ATYP_DOMAINNAME_BS = b'\x03'
+ATYP_IPV6_BS = b'\x04'
+
 ATYP_IPV4 = 1
 ATYP_DOMAINNAME = 3
 ATYP_IPV6 = 4
@@ -76,6 +80,85 @@ def connect_to_the_internet(
     socket_obj.connect((address, port,))
     socket_obj.settimeout(None)
     return socket_obj
+
+
+def serialize_ip_address(
+    ip_address_bytes: bytes,
+):
+    buffer = io.BytesIO()
+    if len(ip_address_bytes) == 4:
+        buffer.write(ATYP_IPV4_BS)
+    elif len(ip_address_bytes) == 16:
+        buffer.write(ATYP_IPV6_BS)
+    else:
+        raise Exception(f'Unknown ip address length {len(ip_address_bytes)}')
+    buffer.write(ip_address_bytes)
+    return buffer.getvalue()
+
+
+def serialize_port_number(
+    port_number: int,
+):
+    bs = struct.pack('!H', port_number)
+    if len(bs) != 2:
+        raise Exception(f'Unknown port number length {len(bs)}')
+    return bs
+
+
+def socks5_client_to_destination_thread_function(
+    socks5_client_socket_handle: socket.socket,
+    destination_socket_handle: socket.socket,
+    error_log: list
+):
+    try:
+        while True:
+            bs = socks5_client_socket_handle.recv(1024)
+            if len(bs) == 0:
+                ts = time.time_ns()
+                error_log.append({
+                    'time_ns': ts,
+                    'message': 'socks5 client socket closed',
+                })
+
+                break
+
+            destination_socket_handle.send(bs)
+    except Exception as ex:
+        stacktrace = traceback.format_exc()
+        ts = time.time_ns()
+        error_log.append({
+            'time_ns': ts,
+            'stacktrace': stacktrace,
+            'exception': ex,
+        })
+
+
+def destination_to_socks5_client_thread_function(
+    socks5_client_socket_handle: socket.socket,
+    destination_socket_handle: socket.socket,
+    error_log: list
+):
+    try:
+        while True:
+            bs = destination_socket_handle.recv(1024)
+            if len(bs) == 0:
+                ts = time.time_ns()
+                error_log.append({
+                    'time_ns': ts,
+                    'message': 'destination socket closed',
+                })
+
+                break
+
+            socks5_client_socket_handle.send(bs)
+    except Exception as ex:
+        stacktrace = traceback.format_exc()
+        ts = time.time_ns()
+        error_log.append({
+            'time_ns': ts,
+            'stacktrace': stacktrace,
+            'exception': ex,
+        })
 
 
 def handle_client(client_socket: socket.socket, address):
@@ -147,8 +230,73 @@ def handle_client(client_socket: socket.socket, address):
         print(f'{address} -> {destination_address_bytes}:{destination_port}')
 
         if request_command == REQUEST_CMD_CONNECT:
-            # TODO
-            pass
+            # if address_type == ATYP_DOMAINNAME:
+            #     # TODO send dns request
+            #     pass
+
+            destination_socket_obj = connect_to_the_internet(
+                atyp=address_type,
+                address=destination_address_bytes,
+                port=destination_port,
+            )
+
+            try:
+                destination_ip_address, destination_connected_port = destination_socket_obj.getsockname()
+
+                destination_ip_address_bytes = socket.inet_aton(destination_ip_address)
+                destination_port_bytes = serialize_port_number(destination_connected_port)
+
+                buffer = io.BytesIO()
+                buffer.write(b'\x05')  # version
+                buffer.write(b'\x00')  # reply code (success)
+                buffer.write(b'\x00')  # reserved
+                buffer.write(serialize_ip_address(destination_ip_address_bytes))
+                buffer.write(destination_port_bytes)
+                client_socket.send(buffer.getvalue())
+
+                # start 2 threads to handle proxy communication
+                socks5_client_to_destination_thread_error_log = []
+                socks5_client_to_destination_thread = threading.Thread(
+                    target=socks5_client_to_destination_thread_function,
+                    args=(
+                        client_socket,
+                        destination_socket_obj,
+                        socks5_client_to_destination_thread_error_log,
+                    ),
+                )
+
+                destination_to_socks5_client_thread_error_log = []
+                destination_to_socks5_client_thread = threading.Thread(
+                    target=destination_to_socks5_client_thread_function,
+                    args=(
+                        client_socket,
+                        destination_socket_obj,
+                        destination_to_socks5_client_thread_error_log,
+                    ),
+                )
+
+                socks5_client_to_destination_thread.start()
+                destination_to_socks5_client_thread.start()
+
+                print(time.time_ns(), 'waiting for socks5_client_to_destination_thread to finish')
+                socks5_client_to_destination_thread.join()
+                print(time.time_ns(), 'socks5_client_to_destination_thread finished')
+                print(time.time_ns(), 'socks5_client_to_destination_thread finished')
+                destination_to_socks5_client_thread.join()
+                print(time.time_ns(), 'destination_to_socks5_client_thread finished')
+
+                print(time.time_ns(), 'socks5_client_to_destination_thread_error_log:')
+                print(socks5_client_to_destination_thread_error_log)
+
+                print(time.time_ns(), 'destination_to_socks5_client_thread_error_log:')
+                print(destination_to_socks5_client_thread_error_log)
+
+            except Exception as destination_socket_exception:
+                stacktrace = traceback.format_exc()
+                print(stacktrace)
+                print(destination_socket_exception)
+            finally:
+                destination_socket_obj.close()
         elif request_command == REQUEST_CMD_BIND:
             log_msg = 'bind not implemented'
             print(log_msg)
@@ -200,19 +348,6 @@ def handle_client(client_socket: socket.socket, address):
                 print(socket_ex)
 
             raise Exception(log_msg)
-
-        # if address_type == ATYP_DOMAINNAME:
-        #     # TODO send dns request
-        #     pass
-
-        destination_socket_obj = connect_to_the_internet(
-            atyp=address_type,
-            address=destination_address_bytes,
-            port=destination_port,
-        )
-
-        destination_ip_address, destination_connected_port = destination_socket_obj.getsockname()
-        # send response
 
         # 6. Replies
         # The SOCKS request information is sent by the client as soon as it has established a connection to the SOCKS server, and completed the authentication negotiations. The server evaluates the request, and returns a reply formed as follows:
@@ -307,14 +442,23 @@ def main():
 
     port_number = args.port
 
-    server_socket.bind(('', port_number))
+    handle_client_thread_list = []
+
+    server_socket.bind(('0.0.0.0', port_number))
+    print(time.time_ns(), f'Listening on port {port_number}')
     server_socket.listen()
 
     while True:
+        print(time.time_ns(), 'Waiting for client to connect')
         client_socket, address = server_socket.accept()
         print(f'Accepted connection from {address}')
         client_thread = threading.Thread(target=handle_client, args=(client_socket, address))
         client_thread.start()
+        ts = time.time_ns()
+        handle_client_thread_list.append({
+            'thread': client_thread,
+            'time_ns': ts,
+        })
 
 
 if __name__ == '__main__':
