@@ -111,15 +111,19 @@ def serialize_port_number(
     return bs
 
 
-def socks5_client_to_destination_thread_function(
-    socks5_client_socket_handle: socket.socket,
-    destination_socket_handle: socket.socket,
-    error_log: list
+def tunnel_socket_data(
+    source_socket: socket.socket,
+    destination_socket: socket.socket,
+    log_list: list,
+    error_log: list,
 ):
     try:
         while True:
-            bs = socks5_client_socket_handle.recv(1024)
-            if len(bs) == 0:
+            bs = source_socket.recv(16384)
+            recv_ts = time.time_ns()
+            log_list.append((recv_ts, bs,))
+            recv_len = len(bs)
+            if recv_len == 0:
                 ts = time.time_ns()
                 error_log.append({
                     'time_ns': ts,
@@ -128,35 +132,9 @@ def socks5_client_to_destination_thread_function(
 
                 break
 
-            destination_socket_handle.send(bs)
-    except Exception as ex:
-        stacktrace = traceback.format_exc()
-        ts = time.time_ns()
-        error_log.append({
-            'time_ns': ts,
-            'stacktrace': stacktrace,
-            'exception': ex,
-        })
-
-
-def destination_to_socks5_client_thread_function(
-    socks5_client_socket_handle: socket.socket,
-    destination_socket_handle: socket.socket,
-    error_log: list,
-):
-    try:
-        while True:
-            bs = destination_socket_handle.recv(1024)
-            if len(bs) == 0:
-                ts = time.time_ns()
-                error_log.append({
-                    'time_ns': ts,
-                    'message': 'destination socket closed',
-                })
-
-                break
-
-            socks5_client_socket_handle.send(bs)
+            sent_count = 0
+            while sent_count < recv_len:
+                sent_count += destination_socket.send(bs[sent_count:])
     except Exception as ex:
         stacktrace = traceback.format_exc()
         ts = time.time_ns()
@@ -206,173 +184,144 @@ def handle_client(client_socket: socket.socket, address):
             # client_socket.send(b'\x05\xff')
             raise Exception('no supported method found')
 
-        if method == METHOD_NO_AUTHENTICATION_REQUIRED:
-            bs = b'\x05\x00'
-            data_log.append([LOGGING_TYPE_FROM_ME_TO_CLIENT, time.time_ns(), bs, ])
+        if method != METHOD_NO_AUTHENTICATION_REQUIRED:
+            raise Exception(f'unsupported method {method}')
+
+        bs = b'\x05\x00'
+        data_log.append([LOGGING_TYPE_FROM_ME_TO_CLIENT, time.time_ns(), bs, ])
+        client_socket.send(bs)
+
+        bs = receive_socket_data_and_assert(client_socket, 4, 'client request header')
+        data_log.append([LOGGING_TYPE_FROM_CLIENT_TO_ME, time.time_ns(), bs, ])
+        version = bs[0]
+        if version != 5:
+            raise Exception(f'unsupported socks version {version}')
+
+        request_command = bs[1]
+        if request_command not in REQUEST_CMD_LIST:
+            raise Exception(f'unsupported request command {request_command}')
+
+        reserved_byte = bs[2]
+        if reserved_byte != 0:
+            raise Exception(f'unsupported reserved byte {reserved_byte} - must be 0')
+
+        address_type = bs[3]
+
+        if address_type not in ATYP_LIST:
+            raise Exception(f'unsupported address type {address_type}')
+
+        destination_address_bytes = None
+
+        if address_type == ATYP_IPV4:
+            bs = receive_socket_data_and_assert(client_socket, 4, 'ipv4 address')
+            data_log.append([LOGGING_TYPE_FROM_CLIENT_TO_ME, time.time_ns(), bs, ])
+            destination_address_bytes = bs
+            # destination_address['ipv4_str'] = socket.inet_ntoa(bs)
+        elif address_type == ATYP_DOMAINNAME:
+            bs = receive_socket_data_and_assert(client_socket, 1, 'domainname length')
+            data_log.append([LOGGING_TYPE_FROM_CLIENT_TO_ME, time.time_ns(), bs, ])
+            domainname_length = bs[0]
+            bs = receive_socket_data_and_assert(client_socket, domainname_length, 'domainname bytes')
+            data_log.append([LOGGING_TYPE_FROM_CLIENT_TO_ME, time.time_ns(), bs, ])
+            destination_address_bytes = bs
+            # destination_address['domainname_ascii_str'] = bs.decode('ascii')
+        elif address_type == ATYP_IPV6:
+            bs = receive_socket_data_and_assert(client_socket, 16, 'ipv6 address')
+            data_log.append([LOGGING_TYPE_FROM_CLIENT_TO_ME, time.time_ns(), bs, ])
+            destination_address_bytes = bs
+            # destination_address['ipv6_str'] = socket.inet_ntop(socket.AF_INET6, bs)
+        else:
+            raise Exception(f'unsupported address type {address_type}')
+
+        bs = receive_socket_data_and_assert(client_socket, 2, 'port')
+        data_log.append([LOGGING_TYPE_FROM_CLIENT_TO_ME, time.time_ns(), bs, ])
+        destination_port = struct.unpack('>H', bs)[0]
+
+        print(f'{address} -> {destination_address_bytes}:{destination_port}')
+
+        if request_command != REQUEST_CMD_CONNECT:
+            # TODO handle other request commands
+            raise Exception(f'unsupported request command {request_command}')
+        # if address_type == ATYP_DOMAINNAME:
+        #     # TODO send dns request
+        #     pass
+
+        destination_socket_obj = connect_to_the_internet(
+            atyp=address_type,
+            address=destination_address_bytes,
+            port=destination_port,
+        )
+
+        try:
+            destination_ip_address, destination_connected_port = destination_socket_obj.getsockname()
+
+            destination_ip_address_bytes = socket.inet_aton(destination_ip_address)
+            destination_port_bytes = serialize_port_number(destination_connected_port)
+
+            buffer = io.BytesIO()
+            buffer.write(b'\x05')  # version
+            buffer.write(b'\x00')  # reply code (success)
+            buffer.write(b'\x00')  # reserved
+            buffer.write(serialize_ip_address(destination_ip_address_bytes))
+            buffer.write(destination_port_bytes)
+            bs = buffer.getvalue()
             client_socket.send(bs)
+            data_log.append([LOGGING_TYPE_FROM_ME_TO_CLIENT, time.time_ns(), bs, ])
 
-            bs = receive_socket_data_and_assert(client_socket, 4, 'client request header')
-            version = bs[0]
-            if version != 5:
-                raise Exception(f'unsupported socks version {version}')
+            # start 2 threads to handle proxy communication
+            client_to_destination_thread_log_list = []
+            client_to_destination_thread_error_log = []
+            socks5_client_to_destination_thread = threading.Thread(
+                target=tunnel_socket_data,
+                args=(
+                    client_socket,
+                    destination_socket_obj,
+                    client_to_destination_thread_log_list,
+                    client_to_destination_thread_error_log,
+                ),
+            )
 
-            request_command = bs[1]
-            if request_command not in REQUEST_CMD_LIST:
-                raise Exception(f'unsupported request command {request_command}')
+            destination_to_socks5_client_thread_log_list = []
+            destination_to_socks5_client_thread_error_log = []
+            destination_to_socks5_client_thread = threading.Thread(
+                target=tunnel_socket_data,
+                args=(
+                    destination_socket_obj,
+                    client_socket,
+                    destination_to_socks5_client_thread_log_list,
+                    destination_to_socks5_client_thread_error_log,
+                ),
+            )
 
-            reserved_byte = bs[2]
-            if reserved_byte != 0:
-                raise Exception(f'unsupported reserved byte {reserved_byte} - must be 0')
+            socks5_client_to_destination_thread.start()
+            destination_to_socks5_client_thread.start()
 
-            address_type = bs[3]
+            print(time.time_ns(), 'waiting for socks5_client_to_destination_thread to finish')
+            socks5_client_to_destination_thread.join()
+            print(time.time_ns(), 'socks5_client_to_destination_thread finished')
+            print(time.time_ns(), 'socks5_client_to_destination_thread finished')
+            destination_to_socks5_client_thread.join()
+            print(time.time_ns(), 'destination_to_socks5_client_thread finished')
 
-            if address_type not in ATYP_LIST:
-                raise Exception(f'unsupported address type {address_type}')
+            if len(socks5_client_to_destination_thread_error_log) > 0:
+                for error in socks5_client_to_destination_thread_error_log:
+                    print(error)
 
-            destination_address_bytes = None
+            if len(destination_to_socks5_client_thread_error_log) > 0:
+                for error in destination_to_socks5_client_thread_error_log:
+                    print(error)
 
-            if address_type == ATYP_IPV4:
-                bs = receive_socket_data_and_assert(client_socket, 4, 'ipv4 address')
-                destination_address_bytes = bs
-                # destination_address['ipv4_str'] = socket.inet_ntoa(bs)
-            elif address_type == ATYP_DOMAINNAME:
-                bs = receive_socket_data_and_assert(client_socket, 1, 'domainname length')
-                domainname_length = bs[0]
-                bs = receive_socket_data_and_assert(client_socket, domainname_length, 'domainname bytes')
-                destination_address_bytes = bs
-                # destination_address['domainname_ascii_str'] = bs.decode('ascii')
-            elif address_type == ATYP_IPV6:
-                bs = receive_socket_data_and_assert(client_socket, 16, 'ipv6 address')
-                destination_address_bytes = bs
-                # destination_address['ipv6_str'] = socket.inet_ntop(socket.AF_INET6, bs)
-            else:
-                raise Exception(f'unsupported address type {address_type}')
+            for (log_ts, log_bs) in client_to_destination_thread_log_list:
+                data_log.append([LOGGING_TYPE_FROM_CLIENT_TO_DESTINATION, log_ts, log_bs, ])
 
-            bs = receive_socket_data_and_assert(client_socket, 2, 'port')
-            destination_port = struct.unpack('>H', bs)[0]
-
-            print(f'{address} -> {destination_address_bytes}:{destination_port}')
-
-            if request_command == REQUEST_CMD_CONNECT:
-                # if address_type == ATYP_DOMAINNAME:
-                #     # TODO send dns request
-                #     pass
-
-                destination_socket_obj = connect_to_the_internet(
-                    atyp=address_type,
-                    address=destination_address_bytes,
-                    port=destination_port,
-                )
-
-                try:
-                    destination_ip_address, destination_connected_port = destination_socket_obj.getsockname()
-
-                    destination_ip_address_bytes = socket.inet_aton(destination_ip_address)
-                    destination_port_bytes = serialize_port_number(destination_connected_port)
-
-                    buffer = io.BytesIO()
-                    buffer.write(b'\x05')  # version
-                    buffer.write(b'\x00')  # reply code (success)
-                    buffer.write(b'\x00')  # reserved
-                    buffer.write(serialize_ip_address(destination_ip_address_bytes))
-                    buffer.write(destination_port_bytes)
-                    client_socket.send(buffer.getvalue())
-
-                    # start 2 threads to handle proxy communication
-                    socks5_client_to_destination_thread_error_log = []
-                    socks5_client_to_destination_thread = threading.Thread(
-                        target=socks5_client_to_destination_thread_function,
-                        args=(
-                            client_socket,
-                            destination_socket_obj,
-                            socks5_client_to_destination_thread_error_log,
-                        ),
-                    )
-
-                    destination_to_socks5_client_thread_error_log = []
-                    destination_to_socks5_client_thread = threading.Thread(
-                        target=destination_to_socks5_client_thread_function,
-                        args=(
-                            client_socket,
-                            destination_socket_obj,
-                            destination_to_socks5_client_thread_error_log,
-                        ),
-                    )
-
-                    socks5_client_to_destination_thread.start()
-                    destination_to_socks5_client_thread.start()
-
-                    print(time.time_ns(), 'waiting for socks5_client_to_destination_thread to finish')
-                    socks5_client_to_destination_thread.join()
-                    print(time.time_ns(), 'socks5_client_to_destination_thread finished')
-                    print(time.time_ns(), 'socks5_client_to_destination_thread finished')
-                    destination_to_socks5_client_thread.join()
-                    print(time.time_ns(), 'destination_to_socks5_client_thread finished')
-
-                    print(time.time_ns(), 'socks5_client_to_destination_thread_error_log:')
-                    print(socks5_client_to_destination_thread_error_log)
-
-                    print(time.time_ns(), 'destination_to_socks5_client_thread_error_log:')
-                    print(destination_to_socks5_client_thread_error_log)
-
-                except Exception as destination_socket_exception:
-                    stacktrace = traceback.format_exc()
-                    print(stacktrace)
-                    print(destination_socket_exception)
-                finally:
-                    destination_socket_obj.close()
-            elif request_command == REQUEST_CMD_BIND:
-                log_msg = 'bind not implemented'
-                print(log_msg)
-                buffer = io.BytesIO()
-                buffer.write(b'\x05')  # version
-                buffer.write(REP_COMMAND_NOT_SUPPORTED)  # reply code
-                buffer.write(b'\x00')  # reserved
-
-                try:
-                    client_socket.settimeout(10)
-                    client_socket.send(buffer.getvalue())
-                except Exception as socket_ex:
-                    stacktrace = traceback.format_exc()
-                    print(stacktrace)
-                    print(socket_ex)
-
-                raise Exception(log_msg)
-            elif request_command == REQUEST_CMD_UDP_ASSOCIATE:
-                log_msg = 'udp associate not implemented'
-                print(log_msg)
-                buffer = io.BytesIO()
-                buffer.write(b'\x05')
-                buffer.write(REP_COMMAND_NOT_SUPPORTED)
-                buffer.write(b'\x00')
-
-                try:
-                    client_socket.settimeout(10)
-                    client_socket.send(buffer.getvalue())
-                except Exception as socket_ex:
-                    stacktrace = traceback.format_exc()
-                    print(stacktrace)
-                    print(socket_ex)
-
-                raise Exception(log_msg)
-            else:
-                log_msg = f'unsupported request command {request_command}'
-                print(log_msg)
-                buffer = io.BytesIO()
-                buffer.write(b'\x05')
-                buffer.write(REP_COMMAND_NOT_SUPPORTED)
-                buffer.write(b'\x00')
-
-                try:
-                    client_socket.settimeout(10)
-                    client_socket.send(buffer.getvalue())
-                except Exception as socket_ex:
-                    stacktrace = traceback.format_exc()
-                    print(stacktrace)
-                    print(socket_ex)
-
-                raise Exception(log_msg)
-
+            for (log_ts, log_bs) in destination_to_socks5_client_thread_log_list:
+                data_log.append([LOGGING_TYPE_FROM_DESTINATION_TO_CLIENT, log_ts, log_bs, ])
+        except Exception as destination_socket_exception:
+            stacktrace = traceback.format_exc()
+            print(stacktrace)
+            print(destination_socket_exception)
+        finally:
+            destination_socket_obj.close()
     except Exception as ex:
         stacktrace = traceback.format_exc()
         print(ex)
