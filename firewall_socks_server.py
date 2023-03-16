@@ -15,6 +15,15 @@ R = '\033[91m'
 G = '\033[92m'
 Y = '\033[93m'
 
+BLACKLIST_DOMAINNAME_LIST = [
+    # 'google.com',
+    'googleapis.com',
+    'crashlytics.com',
+    'facebook.com',
+    'darkreader.org',
+    'exp-tas.com',
+]
+
 
 def make_obj_pickle_friendly(obj):
     try:
@@ -260,7 +269,10 @@ def handle_client(client_socket: socket.socket, address):
             data_log.append([LOGGING_TYPE_FROM_CLIENT_TO_ME, time.time_ns(), bs, ])
             destination_address_bytes = bs
             # TODO Do we need to decode bytes to string for domain name?
-            destination_address = bs
+            destination_address = bs.decode('ascii')
+            for domain_str in BLACKLIST_DOMAINNAME_LIST:
+                if domain_str in destination_address:
+                    raise Exception(f'blacklisted domain name {domain_str} in {destination_address}')
             # destination_address['domainname_ascii_str'] = bs.decode('ascii')
         elif address_type == ATYP_IPV6:
             bs = receive_socket_data_and_assert(client_socket, 16, 'ipv6 address')
@@ -353,10 +365,10 @@ def handle_client(client_socket: socket.socket, address):
                     print(error)
 
             for (log_ts, log_bs) in client_to_destination_thread_log_list:
-                data_log.append([LOGGING_TYPE_FROM_CLIENT_TO_DESTINATION, log_ts, log_bs, ])
+                data_log.append([LOGGING_TYPE_FROM_ME_TO_DESTINATION, log_ts, log_bs, ])
 
             for (log_ts, log_bs) in destination_to_client_thread_log_list:
-                data_log.append([LOGGING_TYPE_FROM_DESTINATION_TO_CLIENT, log_ts, log_bs, ])
+                data_log.append([LOGGING_TYPE_FROM_DESTINATION_TO_ME, log_ts, log_bs, ])
         except Exception as destination_socket_exception:
             stacktrace = traceback.format_exc()
             print(f'{Y}{destination_socket_exception}{RS}')
@@ -376,8 +388,11 @@ def handle_client(client_socket: socket.socket, address):
         }
 
         output_log_data = make_obj_pickle_friendly(obj=output_log_data)
-
-        output_filepath = f'{handle_client_ts}_output_log_data.pickle.gzip'
+        output_root = 'output_log_data'
+        if not os.path.exists(output_root):
+            os.makedirs(output_root)
+        # output_filepath = f'{handle_client_ts}_output_log_data.pickle.gzip'
+        output_filepath = os.path.join(output_root, f'{handle_client_ts}.pickle.gzip')
         pickle_bs = pickle.dumps(output_log_data)
         with gzip.open(output_filepath, 'wb', compresslevel=9) as outfile:
             outfile.write(pickle_bs)
