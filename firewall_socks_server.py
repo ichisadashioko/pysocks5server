@@ -10,6 +10,35 @@ import traceback
 import pickle
 import gzip
 
+RS = '\033[0m'
+R = '\033[91m'
+G = '\033[92m'
+Y = '\033[93m'
+
+
+def make_obj_pickle_friendly(obj):
+    try:
+        pickle.dumps(obj)
+        return obj
+    except Exception:
+        if isinstance(obj, dict):
+            return {
+                key: make_obj_pickle_friendly(value)
+                for key, value in obj.items()
+            }
+        elif isinstance(obj, list):
+            return [
+                make_obj_pickle_friendly(value)
+                for value in obj
+            ]
+        elif isinstance(obj, tuple):
+            return tuple(
+                make_obj_pickle_friendly(value)
+                for value in obj
+            )
+        else:
+            return repr(obj)
+
 
 def receive_socket_data_and_assert(
     socket_obj: socket.socket,
@@ -69,9 +98,10 @@ DEFAULT_CONNECT_TIMEOUT = 5
 
 def connect_to_the_internet(
     atyp: int,
-    address: bytes,
+    address,
     port: int,
 ):
+    print(f'{G}{atyp}{RS} {R}{address}:{port}{RS}')
     if atyp == ATYP_IPV4:
         socket_obj = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     elif atyp == ATYP_DOMAINNAME:
@@ -83,7 +113,8 @@ def connect_to_the_internet(
         raise Exception(f'Unknown atyp {atyp}')
 
     socket_obj.settimeout(DEFAULT_CONNECT_TIMEOUT)
-    socket_obj.connect((address, port,))
+    address_port = (address, port)
+    socket_obj.connect(address_port)
     socket_obj.settimeout(None)
     return socket_obj
 
@@ -152,7 +183,9 @@ LOGGING_TYPE_FROM_DESTINATION_TO_ME = 3
 
 
 def handle_client(client_socket: socket.socket, address):
+    handle_client_ts = time.time_ns()
     data_log = []
+    error_log = []
     try:
         bs = receive_socket_data_and_assert(client_socket, 1, 'version identifier')
         data_log.append([LOGGING_TYPE_FROM_CLIENT_TO_ME, time.time_ns(), bs, ])
@@ -211,11 +244,13 @@ def handle_client(client_socket: socket.socket, address):
             raise Exception(f'unsupported address type {address_type}')
 
         destination_address_bytes = None
+        destination_address = None
 
         if address_type == ATYP_IPV4:
             bs = receive_socket_data_and_assert(client_socket, 4, 'ipv4 address')
             data_log.append([LOGGING_TYPE_FROM_CLIENT_TO_ME, time.time_ns(), bs, ])
             destination_address_bytes = bs
+            destination_address = socket.inet_ntoa(bs)
             # destination_address['ipv4_str'] = socket.inet_ntoa(bs)
         elif address_type == ATYP_DOMAINNAME:
             bs = receive_socket_data_and_assert(client_socket, 1, 'domainname length')
@@ -224,20 +259,26 @@ def handle_client(client_socket: socket.socket, address):
             bs = receive_socket_data_and_assert(client_socket, domainname_length, 'domainname bytes')
             data_log.append([LOGGING_TYPE_FROM_CLIENT_TO_ME, time.time_ns(), bs, ])
             destination_address_bytes = bs
+            # TODO Do we need to decode bytes to string for domain name?
+            destination_address = bs
             # destination_address['domainname_ascii_str'] = bs.decode('ascii')
         elif address_type == ATYP_IPV6:
             bs = receive_socket_data_and_assert(client_socket, 16, 'ipv6 address')
             data_log.append([LOGGING_TYPE_FROM_CLIENT_TO_ME, time.time_ns(), bs, ])
             destination_address_bytes = bs
+            destination_address = socket.inet_ntop(socket.AF_INET6, bs)
             # destination_address['ipv6_str'] = socket.inet_ntop(socket.AF_INET6, bs)
         else:
             raise Exception(f'unsupported address type {address_type}')
+
+        if destination_address is None:
+            raise Exception('destination_address is None')
 
         bs = receive_socket_data_and_assert(client_socket, 2, 'port')
         data_log.append([LOGGING_TYPE_FROM_CLIENT_TO_ME, time.time_ns(), bs, ])
         destination_port = struct.unpack('>H', bs)[0]
 
-        print(f'{address} -> {destination_address_bytes}:{destination_port}')
+        print(f'{address} -> {destination_address}:{destination_port}')
 
         if request_command != REQUEST_CMD_CONNECT:
             # TODO handle other request commands
@@ -248,7 +289,7 @@ def handle_client(client_socket: socket.socket, address):
 
         destination_socket_obj = connect_to_the_internet(
             atyp=address_type,
-            address=destination_address_bytes,
+            address=destination_address,
             port=destination_port,
         )
 
@@ -281,15 +322,15 @@ def handle_client(client_socket: socket.socket, address):
                 ),
             )
 
-            destination_to_socks5_client_thread_log_list = []
-            destination_to_socks5_client_thread_error_log = []
+            destination_to_client_thread_log_list = []
+            destination_to_client_thread_error_log = []
             destination_to_socks5_client_thread = threading.Thread(
                 target=tunnel_socket_data,
                 args=(
                     destination_socket_obj,
                     client_socket,
-                    destination_to_socks5_client_thread_log_list,
-                    destination_to_socks5_client_thread_error_log,
+                    destination_to_client_thread_log_list,
+                    destination_to_client_thread_error_log,
                 ),
             )
 
@@ -303,30 +344,44 @@ def handle_client(client_socket: socket.socket, address):
             destination_to_socks5_client_thread.join()
             print(time.time_ns(), 'destination_to_socks5_client_thread finished')
 
-            if len(socks5_client_to_destination_thread_error_log) > 0:
-                for error in socks5_client_to_destination_thread_error_log:
+            if len(client_to_destination_thread_error_log) > 0:
+                for error in client_to_destination_thread_error_log:
                     print(error)
 
-            if len(destination_to_socks5_client_thread_error_log) > 0:
-                for error in destination_to_socks5_client_thread_error_log:
+            if len(destination_to_client_thread_error_log) > 0:
+                for error in destination_to_client_thread_error_log:
                     print(error)
 
             for (log_ts, log_bs) in client_to_destination_thread_log_list:
                 data_log.append([LOGGING_TYPE_FROM_CLIENT_TO_DESTINATION, log_ts, log_bs, ])
 
-            for (log_ts, log_bs) in destination_to_socks5_client_thread_log_list:
+            for (log_ts, log_bs) in destination_to_client_thread_log_list:
                 data_log.append([LOGGING_TYPE_FROM_DESTINATION_TO_CLIENT, log_ts, log_bs, ])
         except Exception as destination_socket_exception:
             stacktrace = traceback.format_exc()
-            print(stacktrace)
-            print(destination_socket_exception)
+            print(f'{Y}{destination_socket_exception}{RS}')
+            print(f'{R}{stacktrace}{RS}')
+            error_log.append((time.time_ns(), destination_socket_exception, stacktrace,))
         finally:
             destination_socket_obj.close()
     except Exception as ex:
         stacktrace = traceback.format_exc()
-        print(ex)
-        print(stacktrace)
+        print(f'{Y}{ex}{RS}')
+        print(f'{R}{stacktrace}{RS}')
+        error_log.append((time.time_ns(), ex, stacktrace,))
     finally:
+        output_log_data = {
+            'data_log': data_log,
+            'error_log': error_log,
+        }
+
+        output_log_data = make_obj_pickle_friendly(obj=output_log_data)
+
+        output_filepath = f'{handle_client_ts}_output_log_data.pickle.gzip'
+        pickle_bs = pickle.dumps(output_log_data)
+        with gzip.open(output_filepath, 'wb', compresslevel=9) as outfile:
+            outfile.write(pickle_bs)
+
         client_socket.close()
         print(f'Closed connection to {address}')
 
